@@ -1,7 +1,8 @@
 import csv
 import math
-import mip
+import pulp
 import sys
+from collections import defaultdict
 
 
 def parse_input(filename):
@@ -122,7 +123,7 @@ def build_graph_with_times(points, base_point, entry_points):
 
 def solve_drone_routing(points, base_point, graph, entry_points, num_drones=4):
     """
-    Risolve il problema di routing dei droni usando MIP
+    Risolve il problema di routing dei droni usando PuLP
     
     Args:
         points: lista di punti (x, y, z, idx)
@@ -132,11 +133,11 @@ def solve_drone_routing(points, base_point, graph, entry_points, num_drones=4):
         num_drones: numero di droni (default 4)
     
     Returns:
-        dict: {drone_id: [sequenza di nodi]}
+        tuple: (routes, makespan) dove routes = {drone_id: [sequenza di nodi]}
     """
     
     # Crea il modello
-    model = mip.Model()
+    model = pulp.LpProblem("DroneRouting", pulp.LpMinimize)
     
     # Nodi
     n = len(points)
@@ -154,112 +155,138 @@ def solve_drone_routing(points, base_point, graph, entry_points, num_drones=4):
     x = {}
     for (i, j) in graph.keys():
         for k in K:
-            x[i, j, k] = model.add_var(var_type=mip.BINARY, 
-                                       name=f'x_{i}_{j}_{k}')
+            x[i, j, k] = pulp.LpVariable(f'x_{i}_{j}_{k}', cat=pulp.LpBinary)
     
     # T = makespan (tempo massimo)
-    T = model.add_var(var_type=mip.CONTINUOUS, name='makespan', lb=0)
+    T = pulp.LpVariable('makespan', lowBound=0, cat=pulp.LpContinuous)
+    
+    # u[i,k] = variabile di ordine per eliminazione subtour (MTZ)
+    # u[i,k] indica la posizione del nodo i nel tour del drone k
+    u = {}
+    for i in grid_nodes:
+        for k in K:
+            u[i, k] = pulp.LpVariable(f'u_{i}_{k}', lowBound=1, upBound=n, cat=pulp.LpContinuous)
     
     # ========== VINCOLI ==========
     
-    # 1. Coverage: ogni punto visitato esattamente una volta
+    # 1. Coverage: ogni punto visitato esattamente una volta (da un solo drone)
     print("Aggiunta vincoli coverage...")
     for i in grid_nodes:
-        model.add_constr(
-            mip.xsum(x[j, i, k] 
-                    for k in K 
-                    for j in nodes 
-                    if (j, i) in graph) == 1,
-            name=f'coverage_{i}'
+        model += (
+            pulp.lpSum(x[j, i, k] 
+                      for k in K 
+                      for j in nodes 
+                      if (j, i) in graph) == 1,
+            f'coverage_{i}'
         )
     
-    # 2. Flow conservation: se entri devi uscire
+    # 2. Flow conservation: se entri in un nodo devi uscire
     print("Aggiunta vincoli flow conservation...")
-    for i in nodes:
+    for i in grid_nodes:
         for k in K:
             # Archi entranti in i
-            in_arcs = mip.xsum(x[j, i, k] 
-                              for j in nodes 
-                              if (j, i) in graph)
+            in_arcs = pulp.lpSum(x[j, i, k] 
+                                for j in nodes 
+                                if (j, i) in graph)
             # Archi uscenti da i
-            out_arcs = mip.xsum(x[i, j, k] 
-                               for j in nodes 
-                               if (i, j) in graph)
+            out_arcs = pulp.lpSum(x[i, j, k] 
+                                 for j in nodes 
+                                 if (i, j) in graph)
             
-            model.add_constr(in_arcs == out_arcs, 
-                           name=f'flow_{i}_{k}')
+            model += (in_arcs == out_arcs, f'flow_{i}_{k}')
     
-    # 3. Departure from base: ogni drone parte al massimo una volta
+    # 3. Ogni drone parte dalla base al massimo una volta
     print("Aggiunta vincoli departure...")
     for k in K:
-        model.add_constr(
-            mip.xsum(x[0, j, k] 
-                    for j in grid_nodes 
-                    if (0, j) in graph) <= 1,
-            name=f'departure_{k}'
+        model += (
+            pulp.lpSum(x[0, j, k] 
+                      for j in grid_nodes 
+                      if (0, j) in graph) <= 1,
+            f'departure_{k}'
         )
     
-    # 4. Return to base è già garantito da flow conservation
+    # 4. Ogni drone torna alla base al massimo una volta (bilanciamento con partenza)
+    for k in K:
+        departures = pulp.lpSum(x[0, j, k] for j in grid_nodes if (0, j) in graph)
+        arrivals = pulp.lpSum(x[j, 0, k] for j in grid_nodes if (j, 0) in graph)
+        model += (departures == arrivals, f'return_{k}')
     
-    # 5. Makespan: tempo di ogni drone <= T
+    # 5. Subtour elimination (MTZ constraints)
+    print("Aggiunta vincoli subtour elimination (MTZ)...")
+    for k in K:
+        for (i, j) in graph.keys():
+            if i != 0 and j != 0:  # Non applicare per archi da/verso la base
+                # Se x[i,j,k] = 1, allora u[j,k] >= u[i,k] + 1
+                model += (
+                    u[j, k] >= u[i, k] + 1 - n * (1 - x[i, j, k]),
+                    f'mtz_{i}_{j}_{k}'
+                )
+    
+    # 6. Makespan: tempo di ogni drone <= T
     print("Aggiunta vincoli makespan...")
     for k in K:
-        drone_time = mip.xsum(graph[i, j] * x[i, j, k] 
-                             for (i, j) in graph.keys())
-        model.add_constr(drone_time <= T, 
-                        name=f'makespan_{k}')
-  
+        drone_time = pulp.lpSum(graph[i, j] * x[i, j, k] 
+                               for (i, j) in graph.keys())
+        model += (drone_time <= T, f'makespan_{k}')
     
     # ========== FUNZIONE OBIETTIVO ==========
-    model.objective = mip.minimize(T)
+    model += T
     
-    print(f"Modello creato: {model.num_cols} variabili, {model.num_rows} vincoli")
+    print(f"Modello creato: {len(model.variables())} variabili, {len(model.constraints)} vincoli")
     
     # ========== RISOLUZIONE ==========
     print("\nInizio ottimizzazione...")
     
-    # Imposta parametri del solver
-    model.max_gap = 0.05  # Gap di ottimalità 5%
-    model.max_seconds = 300  # Timeout 5 minuti
-    
-    status = model.optimize()
+    # Usa CBC solver con timeout
+    solver = pulp.PULP_CBC_CMD(msg=1, timeLimit=300, gapRel=0.05)  # type: ignore
+    status = model.solve(solver)
     
     # ========== ESTRAZIONE SOLUZIONE ==========
     
-    if status == mip.OptimizationStatus.OPTIMAL:
+    if status == pulp.LpStatusOptimal:
         print(f"\n✓ Soluzione ottima trovata!")
-    elif status == mip.OptimizationStatus.FEASIBLE:
-        print(f"\n✓ Soluzione feasible trovata (non ottima)")
-    else:
-        print(f"\n✗ Nessuna soluzione trovata")
+    elif status == pulp.LpStatusNotSolved:
+        print(f"\n✗ Problema non risolto")
         return None
+    elif status == pulp.LpStatusInfeasible:
+        print(f"\n✗ Problema infeasible")
+        return None
+    elif status == pulp.LpStatusUnbounded:
+        print(f"\n✗ Problema unbounded")
+        return None
+    else:
+        print(f"\n✓ Soluzione trovata (status: {pulp.LpStatus[status]})")
     
-    print(f"Makespan: {T.x:.2f} secondi")
-    print(f"Gap: {model.gap:.2%}")
+    makespan_value = pulp.value(T)
+    print(f"Makespan: {makespan_value:.2f} secondi")
     
     # Estrai i percorsi
     routes = {k: [] for k in K}
     
     for k in K:
-        # Trova il percorso del drone k
-        current = 0  # Parti dalla base
+        # Trova il percorso del drone k partendo dalla base
+        current = 0
         route = [0]
-        visited = set([0])
+        visited = set()
         
         while True:
             # Trova il prossimo nodo
             next_node = None
             for j in nodes:
-                if (current, j) in graph and x[current, j, k].x > 0.5:
-                    next_node = j
-                    break
+                if (current, j) in graph:
+                    val = pulp.value(x[current, j, k])
+                    if val is not None and val > 0.5:
+                        next_node = j
+                        break
             
             if next_node is None or next_node == 0:
-                route.append(0)  # Torna alla base
+                if current != 0:  # Se non siamo già alla base, torniamo
+                    route.append(0)
                 break
             
-            if next_node in visited and next_node != 0:
-                print(f"WARNING: ciclo rilevato nel drone {k}")
+            if next_node in visited:
+                print(f"WARNING: ciclo rilevato nel drone {k} al nodo {next_node}")
+                route.append(0)
                 break
             
             route.append(next_node)
@@ -268,17 +295,32 @@ def solve_drone_routing(points, base_point, graph, entry_points, num_drones=4):
         
         routes[k] = route
     
-    return routes, T.x
+    return routes, makespan_value
+
+
+def print_solution(routes):
+    """
+    Stampa la soluzione nel formato richiesto:
+    Drone 1: 0-4-11-17-...-2-0
+    """
+    for k in sorted(routes.keys()):
+        route = routes[k]
+        if len(route) > 2:  # Ha visitato almeno un punto
+            route_str = '-'.join(map(str, route))
+            print(f"Drone {k}: {route_str}")
+        else:
+            # Drone non usato
+            print(f"Drone {k}: 0-0")
 
 def main(filename):
     """
     Main function che orchestra tutto
     """
     # Determina quale edificio (per base ed entry points)
-    if "Buildinig1" in filename or "Building1" in filename:
+    if "Edificio1" in filename or "Building1" in filename:
         base_point = (0, -16, 0, 0)
         y_threshold = -12.5
-    elif "Building2" in filename or "building2" in filename:
+    elif "Edificio2" in filename or "Building2" in filename:
         base_point = (0, -40, 0, 0)
         y_threshold = -20
     else:
@@ -288,8 +330,79 @@ def main(filename):
     
     # Step 1: Parse input
     print(f"Lettura file: {filename}")
-    points = parse_input(filename)
-    print(f"Punti letti: {len(points)}")
+    all_points = parse_input(filename)
+    print(f"Punti totali nel file: {len(all_points)}")
+    
+    # Per test con subset ridotto: imposta TEST_SIZE a None per usare tutti i punti
+    TEST_SIZE = 25  
+    
+    if TEST_SIZE and TEST_SIZE < len(all_points):
+        # Trova entry points e punti normali
+        entry_point_list = [p for p in all_points if p[1] <= y_threshold]
+        normal_points = [p for p in all_points if p[1] > y_threshold]
+        
+        print(f"Entry points totali: {len(entry_point_list)}")
+        print(f"Punti normali totali: {len(normal_points)}")
+        
+        # Target: ~30% entry points (necessari per connettività e feasibility)
+        num_entry_points = max(6, TEST_SIZE // 3)  # ~8 entry points per 25 punti
+        num_normal_points = TEST_SIZE - num_entry_points
+        
+        print(f"Target: {num_entry_points} entry points, {num_normal_points} punti normali")
+        
+        # Seleziona entry points più vicini alla base
+        entry_point_list.sort(key=lambda p: euclidean_distance(base_point, p))
+        selected_entry_points = entry_point_list[:num_entry_points]
+        
+        # Set di TUTTI gli entry point indices (per escluderli durante l'espansione)
+        all_entry_indices = {p[3] for p in entry_point_list}
+        
+        # Inizia con gli entry points selezionati
+        selected_points = selected_entry_points.copy()
+        selected_indices = {p[3] for p in selected_entry_points}
+        
+        # Espandi BFS-style ma SOLO verso punti normali (non entry points)
+        frontier = selected_entry_points.copy()
+        
+        while len(selected_points) < TEST_SIZE and frontier:
+            # Prendi il punto più vicino alla base dal frontier
+            frontier.sort(key=lambda p: euclidean_distance(base_point, p))
+            current = frontier.pop(0)
+            
+            # Trova vicini non ancora selezionati, ESCLUDENDO altri entry points
+            candidates = []
+            for p in all_points:
+                if p[3] in selected_indices:
+                    continue
+                # ESCLUDI entry points non ancora selezionati
+                if p[3] in all_entry_indices and p[3] not in {ep[3] for ep in selected_entry_points}:
+                    continue
+                if are_connected(current, p):
+                    candidates.append(p)
+            
+            # Ordina candidati per distanza dalla base (più vicini prima)
+            candidates.sort(key=lambda p: euclidean_distance(base_point, p))
+            
+            for p in candidates:
+                if len(selected_points) >= TEST_SIZE:
+                    break
+                if p[3] not in selected_indices:
+                    selected_points.append(p)
+                    selected_indices.add(p[3])
+                    frontier.append(p)
+        
+        # Re-indicizza
+        points = []
+        for new_idx, p in enumerate(selected_points, start=1):
+            points.append((p[0], p[1], p[2], new_idx))
+        
+        print(f"Punti selezionati: {len(points)}")
+        
+        # Verifica distribuzione
+        num_entry_in_selection = sum(1 for p in selected_points if p[1] <= y_threshold)
+        print(f"Entry points nella selezione: {num_entry_in_selection}/{len(points)} ({num_entry_in_selection/len(points)*100:.1f}%)")
+    else:
+            points = all_points
     
     # Step 2: Identifica entry points
     entry_points = get_entry_points(points, y_threshold)
@@ -299,6 +412,21 @@ def main(filename):
     print("Costruzione grafo...")
     graph = build_graph_with_times(points, base_point, entry_points)
     print(f"Archi creati: {len(graph)}")
+    
+    reachable = set([0])  # Base è raggiungibile
+    changed = True
+    while changed:
+        changed = False
+        for (i, j) in graph.keys():
+            if i in reachable and j not in reachable:
+                reachable.add(j)
+                changed = True
+
+    unreachable = set([p[3] for p in points]) - reachable
+    print(f"Punti raggiungibili dalla base: {len(reachable)-1} su {len(points)}")
+    if unreachable:
+        print(f"⚠️ WARNING: {len(unreachable)} punti NON raggiungibili dalla base!")
+        print(f"Punti isolati: {sorted(unreachable)}")
     
     # Step 4: Solve MIP
     print("\n" + "="*50)
@@ -310,12 +438,12 @@ def main(filename):
     
     routes, makespan = result
     
-    # Step 5: Output
+    # Step 5: Output nel formato richiesto
     print("\n" + "="*50)
     print("SOLUZIONE:")
     print("="*50)
-    # print_solution(routes)
-    print(f"\nTempo totale: {makespan:.2f} secondi")
+    print_solution(routes)
+    print(f"\nMakespan (tempo ultimo drone): {makespan:.2f} secondi")
 
 
 if __name__ == "__main__":
@@ -325,4 +453,3 @@ if __name__ == "__main__":
     
     input_file = sys.argv[1]
     main(input_file)
-
