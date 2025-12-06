@@ -136,7 +136,7 @@ def solve_drone_routing(points, base_point, graph, entry_points, num_drones=4):
     """
     
     # Crea il modello
-    model = mip.Model(sense=mip.MINIMIZE, solver_name=mip.CBC)
+    model = mip.Model()
     
     # Nodi
     n = len(points)
@@ -211,7 +211,7 @@ def solve_drone_routing(points, base_point, graph, entry_points, num_drones=4):
   
     
     # ========== FUNZIONE OBIETTIVO ==========
-    model.objective = T
+    model.objective = mip.minimize(T)
     
     print(f"Modello creato: {model.num_cols} variabili, {model.num_rows} vincoli")
     
