@@ -186,38 +186,46 @@ def solve_drone_problem(filename, max_time=600):
     m += T  # Minimizza T (già impostato come LpMinimize)
     
     # --- 6. Risoluzione ---
-    # Time limit di 2 ore (7200 secondi)
+    # Configurazione solver con:
+    # - Time limit: 10 minuti (600 secondi)
+    # - Gap di ottimalità: 5% (accetta soluzioni entro il 5% dall'ottimo)
+    from pulp import PULP_CBC_CMD
+    solver = PULP_CBC_CMD(timeLimit=600, gapRel=0.05, msg=True)
+    m.solve(solver)
     
-    m.solve()
-    
-    if LpStatus[m.status] == 'Optimal':
-        # --- 7. Output Formattato ---
-        for k in range(K):
-            # Ricostruzione percorso
-            path = []
-            current_node = 0
-            
-            # Loop per trovare la sequenza
-            while True:
-                path.append(current_node)
-                # Trova il prossimo nodo
-                next_node = -1
-                for (i, j, cost) in arcs:
-                    if i == current_node and value(x[(i, j, k)]) is not None and value(x[(i, j, k)]) >= 0.99:
-                        next_node = j
+    if LpStatus[m.status] in ['Optimal', 'Not Solved']:
+        # 'Not Solved' può indicare che ha trovato una soluzione feasible ma non provata ottima
+        if value(T) is not None:
+            print(f"Tempo massimo (obiettivo): {value(T):.2f}")
+            # --- 7. Output Formattato ---
+            for k in range(K):
+                # Ricostruzione percorso
+                path = []
+                current_node = 0
+                
+                # Loop per trovare la sequenza
+                while True:
+                    path.append(current_node)
+                    # Trova il prossimo nodo
+                    next_node = -1
+                    for (i, j, cost) in arcs:
+                        if i == current_node and value(x[(i, j, k)]) is not None and value(x[(i, j, k)]) >= 0.99:
+                            next_node = j
+                            break
+                    
+                    if next_node == -1:
+                        break # Dovrebbe non succedere se il modello è corretto
+                        
+                    current_node = next_node
+                    if current_node == 0:
+                        path.append(0)
                         break
                 
-                if next_node == -1:
-                    break # Dovrebbe non succedere se il modello è corretto
-                    
-                current_node = next_node
-                if current_node == 0:
-                    path.append(0)
-                    break
-            
-            # Formattazione stringa "0-4-11-..."
-            path_str = "-".join(map(str, path))
-            print(f"Drone {k+1}: {path_str}")
+                # Formattazione stringa "0-4-11-..."
+                path_str = "-".join(map(str, path))
+                print(f"Drone {k+1}: {path_str}")
+        else:
+            print("Nessuna soluzione valida trovata.")
     else:
         print(f"Nessuna soluzione trovata. Status: {LpStatus[m.status]}")
 
