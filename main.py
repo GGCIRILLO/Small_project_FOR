@@ -1,7 +1,7 @@
 import sys
 import math
 import pandas as pd  # type: ignore
-from pulp import LpProblem, LpMinimize, LpVariable, LpBinary, LpInteger, LpContinuous, lpSum, LpStatus, value, PULP_CBC_CMD
+from mip import Model, xsum, BINARY, INTEGER, CONTINUOUS, OptimizationStatus, MINIMIZE
 
 def calculate_time(p1, p2, is_upward=None):
     """
@@ -122,7 +122,7 @@ def solve_drone_problem(filename, max_time=600):
                 arcs.append((i, j, cost))
 
     # --- 3. Modellazione MIP ---
-    m = LpProblem("Drone_Routing", LpMinimize)
+    m = Model(sense=MINIMIZE, solver_name='HIGHS')
     
     # Variabili decisionali
     # x[i][j][k] = 1 se il drone k percorre l'arco i -> j
@@ -131,14 +131,14 @@ def solve_drone_problem(filename, max_time=600):
     x = {}
     for (i, j, cost) in arcs:
         for k in range(K):
-            x[(i, j, k)] = LpVariable(f'x_{i}_{j}_{k}', cat=LpBinary)
+            x[(i, j, k)] = m.add_var(var_type=BINARY, name=f'x_{i}_{j}_{k}')
             
     # Variabile per il tempo massimo (da minimizzare)
-    T = LpVariable('T_max', lowBound=0, cat=LpContinuous)
+    T = m.add_var(var_type=CONTINUOUS, name='T_max', lb=0)  # type: ignore
     
     # Variabili MTZ per eliminazione sottogiri (u[i])
     # u[i] rappresenta l'ordine di visita per il nodo i
-    u = [LpVariable(f'u_{i}', lowBound=0, upBound=num_nodes, cat=LpInteger) for i in range(num_nodes)]
+    u = [m.add_var(var_type=INTEGER, name=f'u_{i}', lb=0, ub=num_nodes) for i in range(num_nodes)]  # type: ignore
 
     # --- 4. Vincoli ---
     
@@ -146,18 +146,18 @@ def solve_drone_problem(filename, max_time=600):
     for j in range(1, num_nodes): # Per ogni nodo griglia (escluso Base 0)
         # Somma su tutti i droni e tutti i nodi di provenienza i
         incoming_arcs = [x[(i, j, k)] for (i, dest, cost) in arcs for k in range(K) if dest == j]
-        m += lpSum(incoming_arcs) == 1
+        m += xsum(incoming_arcs) == 1
         
     # B. Flusso dei droni alla Base
     # Ogni drone parte dalla base (0) esattamente una volta
     for k in range(K):
         outgoing_base = [x[(0, j, k)] for (src, j, cost) in arcs if src == 0]
-        m += lpSum(outgoing_base) == 1
+        m += xsum(outgoing_base) == 1
         
     # Ogni drone ritorna alla base (0) esattamente una volta
     for k in range(K):
         incoming_base = [x[(i, 0, k)] for (i, dest, cost) in arcs if dest == 0]
-        m += lpSum(incoming_base) == 1
+        m += xsum(incoming_base) == 1
         
     # C. Conservazione del flusso
     # Se un drone k arriva in j, deve ripartire da j
@@ -165,12 +165,12 @@ def solve_drone_problem(filename, max_time=600):
         for node in range(1, num_nodes):
             incoming = [x[(i, node, k)] for (i, dest, cost) in arcs if dest == node]
             outgoing = [x[(node, j, k)] for (src, j, cost) in arcs if src == node]
-            m += lpSum(incoming) - lpSum(outgoing) == 0
+            m += xsum(incoming) - xsum(outgoing) == 0
 
     # D. Calcolo del tempo e Min-Max
     # Il tempo totale del drone k deve essere <= T
     for k in range(K):
-        drone_time = lpSum(x[(i, j, k)] * cost for (i, j, cost) in arcs)
+        drone_time = xsum(x[(i, j, k)] * cost for (i, j, cost) in arcs)
         m += drone_time <= T
 
     # E. Eliminazione Sottogiri (MTZ constraints)
@@ -183,20 +183,19 @@ def solve_drone_problem(filename, max_time=600):
                 m += u[i] - u[j] + M * x[(i, j, k)] <= M - 1
 
     # --- 5. Funzione Obiettivo ---
-    m += T  # Minimizza T (già impostato come LpMinimize)
+    m.objective = T  # Minimizza T
     
     # --- 6. Risoluzione ---
     # Configurazione solver con:
     # - Time limit: 10 minuti (600 secondi)
     # - Gap di ottimalità: 5% (accetta soluzioni entro il 5% dall'ottimo)
-    from pulp import PULP_CBC_CMD
-    solver = PULP_CBC_CMD(timeLimit=600, gapRel=0.05, msg=True)
-    m.solve(solver)
+    m.max_mip_gap = 0.05  # type: ignore
+    m.max_seconds = max_time
+    status = m.optimize()
     
-    if LpStatus[m.status] in ['Optimal', 'Not Solved']:
-        # 'Not Solved' può indicare che ha trovato una soluzione feasible ma non provata ottima
-        if value(T) is not None:
-            print(f"Tempo massimo (obiettivo): {value(T):.2f}")
+    if status == OptimizationStatus.OPTIMAL or status == OptimizationStatus.FEASIBLE:
+        if T.x is not None:
+            print(f"Tempo massimo (obiettivo): {T.x:.2f}")
             # --- 7. Output Formattato ---
             for k in range(K):
                 # Ricostruzione percorso
@@ -209,7 +208,7 @@ def solve_drone_problem(filename, max_time=600):
                     # Trova il prossimo nodo
                     next_node = -1
                     for (i, j, cost) in arcs:
-                        if i == current_node and value(x[(i, j, k)]) is not None and value(x[(i, j, k)]) >= 0.99:
+                        if i == current_node and x[(i, j, k)].x is not None and x[(i, j, k)].x >= 0.99:
                             next_node = j
                             break
                     
@@ -227,7 +226,7 @@ def solve_drone_problem(filename, max_time=600):
         else:
             print("Nessuna soluzione valida trovata.")
     else:
-        print(f"Nessuna soluzione trovata. Status: {LpStatus[m.status]}")
+        print(f"Nessuna soluzione trovata. Status: {status}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
